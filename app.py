@@ -23,6 +23,16 @@ from database import (
 )
 from llm_service import generate_report
 from alerts_service import check_and_send_alerts, send_slack_alert, send_email_alert
+import plotly.express as px
+import plotly.graph_objects as go
+from scheduler import start_scheduler, stop_scheduler
+
+# Initialize scheduler on boot
+if "scheduler_started" not in st.session_state:
+    start_scheduler(hours=24)
+    st.session_state.scheduler_started = True
+    st.session_state.scan_frequency = 24
+
 
 # ── Page Config ─────────────────────────────────────────────────────────
 st.set_page_config(
@@ -149,6 +159,13 @@ st.markdown(
     /* ── Misc Tweaks ──────────────────────────────────────────────────── */
     .stDataFrame { border-radius: 12px; overflow: hidden; }
     div[data-testid="stHorizontalBlock"] { gap: 0.75rem; }
+    
+    /* ── Expander Overrides ───────────────────────────────────────────── */
+    .streamlit-expanderHeader {
+        background-color: var(--bg-card);
+        border-radius: 8px;
+    }
+
     </style>
     """,
     unsafe_allow_html=True,
@@ -274,10 +291,11 @@ with st.sidebar:
             st.warning("No domains in database to re-scan.")
 
 # ── Tabs Configuration ──────────────────────────────────────────────────
-tab_dashboard, tab_manage, tab_settings = st.tabs([
+tab_dashboard, tab_manage, tab_settings, tab_automation = st.tabs([
     "📊 Monitor Dashboard", 
     "📥 Import & Manage", 
-    "⚙️ Alert Settings"
+    "⚙️ Alert Settings",
+    "⏱️ Automation"
 ])
 
 # ════════════════════════════════════════════════════════════════════════
@@ -327,7 +345,7 @@ with tab_dashboard:
             )
             
         with col_chart:
-            # Altair status donut chart
+            # Plotly status donut chart
             status_df = pd.DataFrame([
                 {"Status": "SAFE", "Count": n_safe, "Color": "#00e676"},
                 {"Status": "WARNING", "Count": n_warn, "Color": "#ffab00"},
@@ -337,15 +355,29 @@ with tab_dashboard:
             status_df = status_df[status_df["Count"] > 0]
             
             if not status_df.empty:
-                donut = alt.Chart(status_df).mark_arc(innerRadius=45, outerRadius=70).encode(
-                    theta=alt.Theta(field="Count", type="quantitative"),
-                    color=alt.Color(field="Status", type="nominal", scale=alt.Scale(
-                        domain=status_df["Status"].tolist(),
-                        range=status_df["Color"].tolist()
-                    ), legend=alt.Legend(orient="right")),
-                    tooltip=["Status", "Count"]
-                ).properties(height=140)
-                st.altair_chart(donut, use_container_width=True)
+                fig = px.pie(
+                    status_df, 
+                    values='Count', 
+                    names='Status', 
+                    hole=0.6,
+                    color='Status',
+                    color_discrete_map={
+                        "SAFE": "#00e676",
+                        "WARNING": "#ffab00",
+                        "CRITICAL": "#ff1744",
+                        "ERROR": "#9aa0a6"
+                    }
+                )
+                fig.update_layout(
+                    margin=dict(t=0, b=0, l=0, r=0),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    height=200,
+                    showlegend=True,
+                    legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.0)
+                )
+                fig.update_traces(textposition='inside', textinfo='percent+label')
+                st.plotly_chart(fig, use_container_width=True)
                 
         # ── Main Table ──────────────────────────────────────────────────
         st.markdown("### 🔒 Current Domain Expiry Status")
@@ -471,24 +503,31 @@ with tab_dashboard:
                         if not df_plot.empty:
                             df_plot["Checked Time"] = pd.to_datetime(df_plot["timestamp"])
                             
-                            hist_chart = alt.Chart(df_plot).mark_line(point=True, color="#6c63ff").encode(
-                                x=alt.X("Checked Time:T", title="Time Checked"),
-                                y=alt.Y("days_left:Q", title="Days Left"),
-                                tooltip=["timestamp", "days_left", "status"]
-                            ).properties(height=200)
-                            
-                            st.altair_chart(hist_chart, use_container_width=True)
+                            fig_hist = px.line(
+                                df_plot, x="Checked Time", y="days_left", 
+                                markers=True, title="Expiry Trend",
+                                color_discrete_sequence=["#6c63ff"]
+                            )
+                            fig_hist.update_layout(
+                                margin=dict(t=30, b=0, l=0, r=0),
+                                paper_bgcolor="rgba(0,0,0,0)",
+                                plot_bgcolor="rgba(0,0,0,0)",
+                                height=250,
+                                xaxis_title="Time Checked",
+                                yaxis_title="Days Left"
+                            )
+                            st.plotly_chart(fig_hist, use_container_width=True)
                         else:
                             st.info("No expiry days recorded in history yet (domain failed verification).")
                             
                         # Show raw history records
-                        st.markdown("**Raw History Log**")
-                        st.dataframe(
-                            df_hist[["timestamp", "days_left", "status", "error"]],
-                            use_container_width=True,
-                            hide_index=True,
-                            height=120
-                        )
+                        with st.expander("Show Raw History Log"):
+                            st.dataframe(
+                                df_hist[["timestamp", "days_left", "status", "error"]],
+                                use_container_width=True,
+                                hide_index=True,
+                                height=200
+                            )
                     else:
                         st.info("No scan history recorded yet.")
 
@@ -655,6 +694,46 @@ with tab_settings:
                 st.error("❌ Email delivery failed. Verify server name, port, authentication credentials, and recipients.")
         if not (stat["slack_configured"] or stat["email_configured"]):
             st.info("No credentials supplied. Configure fields and trigger test alert again.")
+
+# ════════════════════════════════════════════════════════════════════════
+# ── TAB 4: Automation ──────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════
+with tab_automation:
+    st.markdown("### ⏱️ Background Task Automation")
+    st.caption("Configure how frequently the system checks certificates and dispatches alerts automatically.")
+    
+    col_auto1, col_auto2 = st.columns([1, 1])
+    
+    with col_auto1:
+        st.markdown("#### Scheduler Status")
+        is_running = st.session_state.get("scheduler_started", False)
+        status_color = "green" if is_running else "red"
+        status_text = "Running" if is_running else "Stopped"
+        st.markdown(f"**Current Status:** <span style='color:{status_color}; font-weight:700'>{status_text}</span>", unsafe_allow_html=True)
+        
+        freq = st.selectbox(
+            "Scan Interval",
+            options=[1, 6, 12, 24, 48],
+            index=3,
+            format_func=lambda x: f"Every {x} hour(s)",
+            help="How often should the background job run?"
+        )
+        
+        if st.button("Apply Interval / Start Scheduler", type="primary", use_container_width=True):
+            stop_scheduler()
+            start_scheduler(hours=freq)
+            st.session_state.scheduler_started = True
+            st.session_state.scan_frequency = freq
+            st.success(f"Scheduler started with an interval of {freq} hours.")
+            st.rerun()
+            
+    with col_auto2:
+        st.markdown("#### Manual Controls")
+        if st.button("⏹️ Stop Scheduler", use_container_width=True):
+            stop_scheduler()
+            st.session_state.scheduler_started = False
+            st.warning("Scheduler stopped. No automated alerts will be sent.")
+            st.rerun()
 
 # ── Footer ──────────────────────────────────────────────────────────────
 st.markdown("---")

@@ -30,29 +30,47 @@ _SYSTEM_PROMPT = (
 )
 
 
+import hashlib
+from database import get_cached_report, cache_report
+
 def generate_report(scan_results: List[Dict[str, object]]) -> Dict[str, str]:
     """
     Generate an AI risk report from scan results.
+    Checks cache first.
 
     Returns dict: {"source": ..., "report": ...}
     """
     user_prompt = _build_user_prompt(scan_results)
+    
+    # Check cache based on input data
+    report_hash = hashlib.md5(user_prompt.encode('utf-8')).hexdigest()
+    cached = get_cached_report(report_hash)
+    if cached:
+        return cached
+
+    report_data = None
 
     # ── Step 1: Groq (primary) ─────────────────────────────────────────
     report = _try_groq(user_prompt)
     if report:
-        return {"source": "Groq (Primary LLM)", "report": report}
+        report_data = {"source": "Groq (Primary LLM)", "report": report}
 
     # ── Step 2: OpenRouter (backup) ────────────────────────────────────
-    report = _try_openrouter(user_prompt)
-    if report:
-        return {"source": "OpenRouter (Backup LLM)", "report": report}
+    if not report_data:
+        report = _try_openrouter(user_prompt)
+        if report:
+            report_data = {"source": "OpenRouter (Backup LLM)", "report": report}
 
     # ── Step 3: Rule-based fallback ────────────────────────────────────
-    return {
-        "source": "Rule-Based Fallback (Safe Mode)",
-        "report": _rule_based_fallback(scan_results),
-    }
+    if not report_data:
+        report_data = {
+            "source": "Rule-Based Fallback (Safe Mode)",
+            "report": _rule_based_fallback(scan_results),
+        }
+        
+    # Save to cache
+    cache_report(report_hash, report_data["report"], report_data["source"])
+    return report_data
 
 
 # ── Private helpers ─────────────────────────────────────────────────────

@@ -60,6 +60,17 @@ def init_db() -> None:
             error         TEXT
         );
         """)
+
+        # Create ai_reports_cache table
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS ai_reports_cache (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_hash   TEXT    NOT NULL UNIQUE,
+            report_text   TEXT    NOT NULL,
+            source        TEXT    NOT NULL,
+            timestamp     TEXT    NOT NULL
+        );
+        """)
         conn.commit()
 
 
@@ -164,6 +175,36 @@ def get_domain_history(domain: str) -> List[Dict[str, object]]:
             (domain.strip().lower(),),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_cached_report(report_hash: str) -> Optional[Dict[str, str]]:
+    """Return a cached report if available."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT report_text, source FROM ai_reports_cache WHERE report_hash = ?",
+            (report_hash,)
+        ).fetchone()
+    if row:
+        return {"report": row["report_text"], "source": row["source"]}
+    return None
+
+
+def cache_report(report_hash: str, report_text: str, source: str) -> None:
+    """Save a generated report to the cache."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO ai_reports_cache (report_hash, report_text, source, timestamp)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(report_hash) DO UPDATE SET
+                report_text = excluded.report_text,
+                source      = excluded.source,
+                timestamp   = excluded.timestamp
+            """,
+            (report_hash, report_text, source, now)
+        )
+        conn.commit()
 
 
 # Auto-initialise when this module is first imported.
